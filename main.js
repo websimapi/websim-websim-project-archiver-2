@@ -253,6 +253,7 @@ async function processProject(project, username, options) {
         // --- PATH 2: Latest Only (Legacy) ---
         else {
             updateStatus(uiId, 'loading', 'Fetching latest revision...');
+            console.log(`[Main] 🚀 Fetching LATEST version for ${project.id} (History skipped)`);
             
             // 1. Resolve Version
             let versionId = project.current_version;

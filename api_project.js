@@ -55,12 +55,18 @@ export async function getAllProjectRevisions(projectId) {
             console.log(`[API-Project] 🧩 Parsed ${pageData.length} items from Page ${pageCount + 1}`);
 
             if (pageData.length > 0) {
+                // Debug the shape of the first item to understand filtering issues
+                const sample = pageData[0];
+                const sampleKeys = typeof sample === 'object' && sample !== null ? Object.keys(sample) : typeof sample;
+                console.log(`[API-Project] 🔍 Sample Item Keys: ${JSON.stringify(sampleKeys)}`);
+
                 // Unwrap if wrapped in { revision: ... }
                 // Sometimes the API returns { id:..., revision: { ... } }
-                if (pageData[0].revision && typeof pageData[0].revision === 'object') {
-                     console.log('[API-Project] Unwrapping nested revision objects...');
+                if (sample && sample.revision && typeof sample.revision === 'object') {
+                     console.log('[API-Project] 🎁 Unwrapping nested revision objects...');
                      pageData = pageData.map(r => r.revision);
                 }
+                
                 allRevisions.push(...pageData);
             } else {
                 console.log('[API-Project] Empty page received. Stopping.');
@@ -86,13 +92,35 @@ export async function getAllProjectRevisions(projectId) {
 
     // Filter valid revisions and deduplicate
     const unique = new Map();
-    allRevisions.forEach(r => {
-        if (r && (r.version !== undefined || r.id)) {
+    let dropped = 0;
+
+    allRevisions.forEach((r, i) => {
+        // Normalize & Guard
+        if (!r || typeof r !== 'object') {
+            dropped++;
+            return;
+        }
+        
+        // Recover version from alternate fields if standard one is missing
+        if (r.version === undefined) {
+             if (r.revision_number !== undefined) r.version = r.revision_number;
+             else if (r.v !== undefined) r.version = r.v;
+        }
+
+        if (r.version !== undefined || r.id) {
             // Use version as key if available, else ID
             const key = r.version !== undefined ? r.version : r.id;
             unique.set(key, r);
+        } else {
+            dropped++;
+            // Log first few failures to help debug
+            if (dropped <= 3) {
+                console.warn(`[API-Project] ⚠️ Dropping invalid item #${i}:`, JSON.stringify(r));
+            }
         }
     });
+
+    if (dropped > 0) console.warn(`[API-Project] 🗑️ Total dropped items: ${dropped}`);
 
     const finalRevisions = Array.from(unique.values()).sort((a,b) => {
         const vA = a.version || 0;
@@ -100,7 +128,7 @@ export async function getAllProjectRevisions(projectId) {
         return vA - vB;
     });
 
-    console.log(`[API-Project] ✅ History Complete: ${finalRevisions.length} unique revisions.`);
+    console.log(`[API-Project] ✅ History Complete: ${finalRevisions.length} unique revisions (Raw: ${allRevisions.length}).`);
     return finalRevisions;
 }
 
