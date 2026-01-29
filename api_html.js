@@ -16,6 +16,10 @@ export async function getProjectHtml(projectId, version) {
             const data = await response.json();
             const rev = data.revision || data; // Handle nested or flat return
             
+            // Debug logs to find where HTML is hiding
+            console.log(`[API] Revision Metadata Keys: [${Object.keys(rev).join(', ')}]`);
+            if (rev.content) console.log(`[API] rev.content keys/type: ${typeof rev.content === 'object' ? JSON.stringify(Object.keys(rev.content)) : typeof rev.content}`);
+            
             // Check common fields where HTML content might be stored
             if (rev.html) return rev.html;
             if (rev.content && typeof rev.content === 'string') return rev.content;

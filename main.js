@@ -184,6 +184,17 @@ async function processProject(project, username, options) {
                  throw new Error("No revisions found to archive.");
             }
 
+            // Filter out duplicates based on version just in case
+            const uniqueRevisions = [];
+            const seenVersions = new Set();
+            for (const r of revisions) {
+                if (!seenVersions.has(r.version)) {
+                    seenVersions.add(r.version);
+                    uniqueRevisions.push(r);
+                }
+            }
+            revisions = uniqueRevisions;
+
             console.log(`[History] 🗓️ Found ${revisions.length} revisions. Range: ${revisions[0]?.version} -> ${revisions[revisions.length-1]?.version}`);
             updateStatus(uiId, 'loading', `Found ${revisions.length} revs. Starting archive...`);
 

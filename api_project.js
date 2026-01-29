@@ -60,11 +60,14 @@ export async function getAllProjectRevisions(projectId) {
                 const sampleKeys = typeof sample === 'object' && sample !== null ? Object.keys(sample) : typeof sample;
                 console.log(`[API-Project] 🔍 Sample Item Keys: ${JSON.stringify(sampleKeys)}`);
 
-                // Unwrap if wrapped in { revision: ... }
+                // Unwrap if wrapped in { revision: ... } or { project_revision: ... }
                 // Sometimes the API returns { id:..., revision: { ... } }
                 if (sample && sample.revision && typeof sample.revision === 'object') {
-                     console.log('[API-Project] 🎁 Unwrapping nested revision objects...');
+                     console.log('[API-Project] 🎁 Unwrapping nested revision objects (key: revision)...');
                      pageData = pageData.map(r => r.revision);
+                } else if (sample && sample.project_revision && typeof sample.project_revision === 'object') {
+                     console.log('[API-Project] 🎁 Unwrapping nested revision objects (key: project_revision)...');
+                     pageData = pageData.map(r => r.project_revision);
                 }
                 
                 allRevisions.push(...pageData);
