@@ -33,8 +33,15 @@ export async function getAllProjectRevisions(projectId) {
         try {
             const response = await getProjectRevisions(projectId, params);
             if (response.revisions && response.revisions.data) {
-                const pageData = response.revisions.data;
+                let pageData = response.revisions.data;
                 console.log(`[API-Project] Page ${pageCount + 1} returned ${pageData.length} revisions.`);
+
+                // Check for wrapped revisions (e.g. { revision: {...} })
+                if (pageData.length > 0 && !pageData[0].version && pageData[0].revision) {
+                     console.log('[API-Project] Unwrapping revision objects...');
+                     pageData = pageData.map(r => r.revision);
+                }
+
                 allRevisions = allRevisions.concat(pageData);
             }
             

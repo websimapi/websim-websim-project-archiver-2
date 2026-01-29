@@ -39,6 +39,12 @@ export async function getAssetMetadata(projectId, version, path) {
 }
 
 export async function getAssets(projectId, version) {
+    // Guard against invalid version
+    if (version === undefined || version === null || Number.isNaN(Number(version))) {
+        console.warn(`[WebSimAPI] getAssets: Aborted invalid version: ${version}`);
+        return [];
+    }
+
     console.log(`[WebSimAPI] getAssets: Project=${projectId}, Version=${version}`);
     let allAssets = [];
     let nextCursor = null;

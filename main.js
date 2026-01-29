@@ -163,9 +163,15 @@ async function processProject(project, username, options) {
             if (!revisions || revisions.length === 0) {
                 // Fallback if revisions list empty (shouldn't happen for valid projects)
                 console.warn(`[History] No revisions found via API, falling back to basic metadata.`);
+                
+                const fallbackVer = project.current_version || 
+                                    project.latest_version?.version || 
+                                    project.latest_revision?.version || 
+                                    1;
+
                 revisions = [{
                     id: project.current_revision?.id,
-                    version: project.current_version || 1,
+                    version: fallbackVer,
                     created_at: project.created_at,
                     created_by: project.created_by
                 }];
@@ -183,7 +189,17 @@ async function processProject(project, username, options) {
                 if (stopRequested) throw new Error("Stopped by user");
                 
                 const rev = revisions[i];
-                const vNum = rev.version;
+                let vNum = rev.version;
+
+                // Robust version recovery
+                if (vNum === undefined || vNum === null) {
+                    if (rev.revision_number) vNum = rev.revision_number; // Alternative field
+                }
+
+                if (vNum === undefined || vNum === null) {
+                     console.warn("[History] Skipping revision with missing version:", rev);
+                     continue;
+                }
                 
                 // Update UI every few items to avoid flashing
                 updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
@@ -255,6 +271,7 @@ async function processProject(project, username, options) {
             }
 
             if (versionId === undefined || versionId === null) throw new Error('No numeric version found');
+            if (Number.isNaN(Number(versionId))) throw new Error(`Invalid version number: ${versionId}`);
 
             // 2. Download
             updateStatus(uiId, 'loading', 'Downloading assets...');

@@ -1,6 +1,12 @@
 import { API_BASE } from './core.js';
 
 export async function getProjectHtml(projectId, version) {
+    // Guard against invalid version
+    if (version === undefined || version === null || Number.isNaN(Number(version))) {
+        console.warn(`[API] getProjectHtml: Aborted invalid version: ${version}`);
+        return null;
+    }
+
     // 1. Priority: Fetch Revision Data (Metadata + potential content)
     // This is more reliable as the dedicated /html endpoint often returns 403
     try {
