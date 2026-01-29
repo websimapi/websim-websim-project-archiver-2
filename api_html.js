@@ -62,7 +62,12 @@ export async function getProjectHtml(projectId, version) {
         }
         // 403 is common for direct endpoint, we rely on metadata fallback in that case.
         if (!response.ok) {
-            console.warn(`[API] Direct HTML fetch status: ${response.status} (Using metadata/fallback)`);
+            // Lower log level for expected 403s
+            if (response.status === 403) {
+                console.log(`[API] Direct HTML access restricted (403). Relied on metadata/assets.`);
+            } else {
+                console.warn(`[API] Direct HTML fetch status: ${response.status}`);
+            }
         }
     } catch (e) {
         console.warn("[API] HTML fetch error:", e);

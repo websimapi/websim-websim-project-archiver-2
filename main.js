@@ -221,39 +221,53 @@ async function processProject(project, username, options) {
                 updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
                 console.log(`[History] 💾 Processing Revision ${vNum} (ID: ${rev.id})...`);
 
-                // A. Fetch Content
-                // Note: We await sequentially to be polite to the API and filesystem
-                const [assetList, htmlContent] = await Promise.all([
-                    getAssets(project.id, vNum),
-                    getProjectHtml(project.id, vNum)
-                ]);
+                try {
+                    // A. Fetch Content
+                    // Note: We await sequentially to be polite to the API and filesystem
+                    const [assetList, htmlContent] = await Promise.all([
+                        getAssets(project.id, vNum),
+                        getProjectHtml(project.id, vNum)
+                    ]);
 
-                // B. Process Assets
-                const files = await processAssets(assetList, project.id, vNum);
+                    // B. Process Assets
+                    const files = await processAssets(assetList, project.id, vNum);
 
-                // C. Add HTML
-                if (htmlContent) {
-                    files['index.html'] = new TextEncoder().encode(htmlContent);
-                } else {
-                     // Even if missing, we write a placeholder so the file exists in git
-                     files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Source Missing -->`);
+                    // C. Add HTML
+                    // Check if index.html was already obtained from assets to avoid overwriting with placeholder
+                    const hasIndex = Object.keys(files).some(k => k.toLowerCase() === 'index.html');
+
+                    if (htmlContent) {
+                        files['index.html'] = new TextEncoder().encode(htmlContent);
+                    } else if (!hasIndex) {
+                         // Only write placeholder if we truly have no index.html from assets or API
+                         console.warn(`[History] Rev ${vNum}: No HTML found in assets or API. Creating placeholder.`);
+                         files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Source Missing (API 403/404) -->`);
+                    }
+
+                    // D. Write to Zip Folder: revisions/VERSION/
+                    const revFolder = revisionsFolder.folder(String(vNum));
+                    for (const [path, content] of Object.entries(files)) {
+                        revFolder.file(path.replace(/^\/+/, ''), content);
+                    }
+
+                    // E. Append to Commit Log
+                    // Format: VERSION|ISO_DATE|AUTHOR|MESSAGE
+                    const date = rev.created_at || new Date().toISOString();
+                    const author = rev.created_by?.username || username || 'unknown';
+                    // Sanitize message
+                    let msg = rev.title || rev.note || rev.description || `Version ${vNum}`;
+                    msg = msg.replace(/\|/g, '-').replace(/[\r\n]+/g, ' '); 
+                    
+                    commitLog += `${vNum}|${date}|${author}|${msg}\n`;
+
+                    // Tiny delay to breathe
+                    await new Promise(r => setTimeout(r, 100));
+
+                } catch (revError) {
+                    console.error(`[History] ⚠️ Failed to archive Revision ${vNum}:`, revError);
+                    // We continue to the next revision instead of failing the whole project
+                    commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED_TO_ARCHIVE\n`;
                 }
-
-                // D. Write to Zip Folder: revisions/VERSION/
-                const revFolder = revisionsFolder.folder(String(vNum));
-                for (const [path, content] of Object.entries(files)) {
-                    revFolder.file(path.replace(/^\/+/, ''), content);
-                }
-
-                // E. Append to Commit Log
-                // Format: VERSION|ISO_DATE|AUTHOR|MESSAGE
-                const date = rev.created_at || new Date().toISOString();
-                const author = rev.created_by?.username || username || 'unknown';
-                // Sanitize message
-                let msg = rev.title || rev.note || rev.description || `Version ${vNum}`;
-                msg = msg.replace(/\|/g, '-').replace(/[\r\n]+/g, ' '); 
-                
-                commitLog += `${vNum}|${date}|${author}|${msg}\n`;
             }
 
             // 4. Write Metadata & Scripts
