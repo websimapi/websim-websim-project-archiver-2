@@ -14,50 +14,94 @@ export function getProjectRevisions(projectId, params = {}) {
 }
 
 export async function getAllProjectRevisions(projectId) {
-    console.log(`[API-Project] Fetching all revisions for ${projectId}...`);
+    console.log(`[API-Project] 📚 Fetching history for ${projectId}...`);
     let allRevisions = [];
     let hasNextPage = true;
     let afterCursor = null;
-
-    // Safety limit to prevent infinite loops on massive histories
     let pageCount = 0;
-    const MAX_PAGES = 100; // Increased limit for full history
+    const MAX_PAGES = 500; 
 
     while (hasNextPage && pageCount < MAX_PAGES) {
-        console.log(`[API-Project] Fetching revisions page ${pageCount + 1}...`);
+        console.log(`[API-Project] 📖 Page ${pageCount + 1} (cursor: ${afterCursor || 'START'})...`);
         const params = { first: 50 };
-        if (afterCursor) {
-            params.after = afterCursor;
-        }
+        if (afterCursor) params.after = afterCursor;
 
         try {
             const response = await getProjectRevisions(projectId, params);
-            if (response.revisions && response.revisions.data) {
-                let pageData = response.revisions.data;
-                console.log(`[API-Project] Page ${pageCount + 1} returned ${pageData.length} revisions.`);
+            
+            // Normalize Response
+            let pageData = [];
+            let meta = null;
 
-                // Check for wrapped revisions (e.g. { revision: {...} })
-                if (pageData.length > 0 && !pageData[0].version && pageData[0].revision) {
-                     console.log('[API-Project] Unwrapping revision objects...');
+            // 1. { revisions: { data: [], meta: {} } }
+            if (response.revisions?.data) {
+                pageData = response.revisions.data;
+                meta = response.revisions.meta;
+            } 
+            // 2. { data: [], meta: {} } (Standard pagination)
+            else if (response.data) {
+                pageData = response.data;
+                meta = response.meta;
+            }
+            // 3. { revisions: [] }
+            else if (Array.isArray(response.revisions)) {
+                pageData = response.revisions;
+            }
+            // 4. [] (Direct array)
+            else if (Array.isArray(response)) {
+                pageData = response;
+            }
+
+            console.log(`[API-Project] 🧩 Parsed ${pageData.length} items from Page ${pageCount + 1}`);
+
+            if (pageData.length > 0) {
+                // Unwrap if wrapped in { revision: ... }
+                // Sometimes the API returns { id:..., revision: { ... } }
+                if (pageData[0].revision && typeof pageData[0].revision === 'object') {
+                     console.log('[API-Project] Unwrapping nested revision objects...');
                      pageData = pageData.map(r => r.revision);
                 }
-
-                allRevisions = allRevisions.concat(pageData);
+                allRevisions.push(...pageData);
+            } else {
+                console.log('[API-Project] Empty page received. Stopping.');
+                hasNextPage = false;
             }
             
-            hasNextPage = response.revisions?.meta?.has_next_page || false;
-            afterCursor = response.revisions?.meta?.end_cursor;
-            
-            if (!afterCursor) hasNextPage = false;
+            // Cursor Logic
+            if (meta?.has_next_page && meta?.end_cursor) {
+                afterCursor = meta.end_cursor;
+            } else {
+                // Check if we just ran out of array data without meta
+                if (!meta) console.log(`[API-Project] No pagination metadata found. Assuming end.`);
+                else console.log(`[API-Project] End of list reached (has_next=${meta.has_next_page}).`);
+                hasNextPage = false;
+            }
+
         } catch (e) {
-            console.warn("[API-Project] Error fetching revision page", e);
+            console.error(`[API-Project] ⚠️ Failed page ${pageCount}:`, e);
             hasNextPage = false;
         }
         pageCount++;
     }
 
-    console.log(`[API-Project] Total revisions fetched: ${allRevisions.length}`);
-    return allRevisions;
+    // Filter valid revisions and deduplicate
+    const unique = new Map();
+    allRevisions.forEach(r => {
+        if (r && (r.version !== undefined || r.id)) {
+            // Use version as key if available, else ID
+            const key = r.version !== undefined ? r.version : r.id;
+            unique.set(key, r);
+        }
+    });
+
+    const finalRevisions = Array.from(unique.values()).sort((a,b) => {
+        const vA = a.version || 0;
+        const vB = b.version || 0;
+        return vA - vB;
+    });
+
+    console.log(`[API-Project] ✅ History Complete: ${finalRevisions.length} unique revisions.`);
+    return finalRevisions;
 }
 
 export function parseProjectIdentifier(input) {

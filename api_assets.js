@@ -52,10 +52,11 @@ export async function getAssets(projectId, version) {
     let page = 0;
     
     while(hasNext && page < 50) { // Safety limit
-        console.log(`[WebSimAPI] Fetching asset page ${page}...`);
         const params = new URLSearchParams();
         params.set('first', '50');
         if (nextCursor) params.set('after', nextCursor);
+
+        console.log(`[WebSimAPI] 📂 Fetching Assets (Page ${page}) for Rev ${version} cursor=${nextCursor || 'START'}`);
 
         try {
             const res = await makeRequest(`/projects/${projectId}/revisions/${version}/assets?${params}`);
@@ -63,34 +64,31 @@ export async function getAssets(projectId, version) {
             let pageData = [];
             let meta = null;
 
-            // Verbose response structure check
-            console.log(`[WebSimAPI] Page ${page} response keys:`, Object.keys(res));
-            if (res.assets) console.log(`[WebSimAPI] res.assets keys:`, Object.keys(res.assets));
-
-            if (Array.isArray(res)) {
-                pageData = res;
-                hasNext = false; 
-            } else if (res.assets && Array.isArray(res.assets)) {
-                pageData = res.assets;
-                hasNext = false;
-            } else if (res.assets && res.assets.data && Array.isArray(res.assets.data)) {
+            // Handle various shapes
+            if (res.assets?.data) {
                 pageData = res.assets.data;
                 meta = res.assets.meta;
-            } else if (res.data && Array.isArray(res.data)) {
+            } else if (res.data) {
                 pageData = res.data;
                 meta = res.meta;
+            } else if (Array.isArray(res.assets)) {
+                pageData = res.assets;
+            } else if (Array.isArray(res)) {
+                pageData = res;
             }
 
-            console.log(`[WebSimAPI] Page ${page} found ${pageData.length} assets.`);
+            console.log(`[WebSimAPI] 📂 Page ${page} found ${pageData.length} assets.`);
             if (pageData.length > 0) allAssets.push(...pageData);
 
-            if (meta && meta.has_next_page && meta.end_cursor) {
+            if (meta?.has_next_page && meta?.end_cursor) {
                 nextCursor = meta.end_cursor;
             } else {
                 hasNext = false;
             }
         } catch(e) {
-            console.error(`[WebSimAPI] Asset fetch page ${page} failed:`, e);
+            console.error(`[WebSimAPI] ⚠️ Asset fetch page ${page} failed:`, e);
+            // If assets fail, we often want to stop this specific asset collection 
+            // but not crash the whole process, so we just break the loop
             hasNext = false;
         }
         page++;

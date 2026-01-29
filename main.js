@@ -178,8 +178,14 @@ async function processProject(project, username, options) {
             }
 
             // 2. Sort Revisions (Oldest -> Newest) for Git History
-            revisions.sort((a, b) => a.version - b.version);
-            console.log(`[History] Found ${revisions.length} revisions. Processing...`);
+            revisions.sort((a, b) => (a.version || 0) - (b.version || 0));
+            
+            if (revisions.length === 0) {
+                 throw new Error("No revisions found to archive.");
+            }
+
+            console.log(`[History] 🗓️ Found ${revisions.length} revisions. Range: ${revisions[0]?.version} -> ${revisions[revisions.length-1]?.version}`);
+            updateStatus(uiId, 'loading', `Found ${revisions.length} revs. Starting archive...`);
 
             const revisionsFolder = outputFolder.folder('revisions');
             let commitLog = "";
@@ -195,15 +201,14 @@ async function processProject(project, username, options) {
                 if (vNum === undefined || vNum === null) {
                     if (rev.revision_number) vNum = rev.revision_number; // Alternative field
                 }
-
+                // Fallback to index if absolutely no version number (rare)
                 if (vNum === undefined || vNum === null) {
-                     console.warn("[History] Skipping revision with missing version:", rev);
-                     continue;
+                     vNum = i + 1;
+                     console.warn(`[History] Revision at index ${i} has no version number. Assigned ${vNum}.`);
                 }
                 
-                // Update UI every few items to avoid flashing
                 updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
-                console.log(`[History] Processing Revision ${vNum}...`);
+                console.log(`[History] 💾 Processing Revision ${vNum} (ID: ${rev.id})...`);
 
                 // A. Fetch Content
                 // Note: We await sequentially to be polite to the API and filesystem
