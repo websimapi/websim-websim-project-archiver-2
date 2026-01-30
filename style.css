@@ -248,3 +248,81 @@ button.stop {
     color: var(--text-dim);
     font-family: monospace;
 }
+
+/* History Panel */
+.history-panel {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--bg);
+    z-index: 1000;
+    padding: 2rem;
+    display: flex;
+    flex-direction: column;
+}
+
+.history-panel.hidden {
+    display: none;
+}
+
+.history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.history-header h2 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.history-list {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    background: var(--surface);
+}
+
+.history-item {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.history-item:hover {
+    background: rgba(255,255,255,0.05);
+}
+
+.history-item-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.history-item-date {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+}
+
+.secondary {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+}
+
+.danger-sm {
+    background: transparent;
+    border: 1px solid var(--error);
+    color: var(--error);
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+}
+.danger-sm:hover {
+    background: var(--error);
+    color: white;
+}

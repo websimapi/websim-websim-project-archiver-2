@@ -3,6 +3,7 @@ import { getAllUserProjectsGenerator } from './api_user.js';
 import { getProjectHtml } from './api_html.js';
 import { getAssets, processAssets } from './api_assets.js';
 import { getAllProjectRevisions, getProjectById, getProjectBySlug } from './api_project.js';
+import { addToCatalog, isArchived, getCatalogAsArray, clearCatalog } from './catalog.js';
 
 // --- State ---
 let isRunning = false;
@@ -28,6 +29,54 @@ const downloadModeInput = document.getElementById('download-mode');
 const delayInput = document.getElementById('delay-ms');
 const skipForksInput = document.getElementById('skip-forks');
 const includeHistoryInput = document.getElementById('include-history');
+const skipArchivedInput = document.getElementById('skip-archived');
+
+// History UI
+const historyBtn = document.getElementById('history-btn');
+const historyPanel = document.getElementById('history-panel');
+const closeHistoryBtn = document.getElementById('close-history-btn');
+const clearHistoryBtn = document.getElementById('clear-history-btn');
+const historyListEl = document.getElementById('history-list');
+const historyStatsEl = document.getElementById('history-stats');
+
+// --- History Logic ---
+const renderHistory = () => {
+    const items = getCatalogAsArray();
+    historyStatsEl.textContent = `${items.length} projects archived`;
+    historyListEl.innerHTML = items.length === 0 
+        ? '<div style="padding:2rem; text-align:center; color:var(--text-dim)">No history found.</div>' 
+        : '';
+    
+    items.forEach(item => {
+        const div = document.createElement('div');
+        div.className = 'history-item';
+        const dateStr = new Date(item.timestamp).toLocaleString();
+        div.innerHTML = `
+            <div class="history-item-info">
+                <strong>${item.title}</strong>
+                <span class="history-item-date">${item.username} / ${item.slug} • ${dateStr}</span>
+            </div>
+            <div class="status-icon done" style="width:20px; height:20px; font-size:0.7rem;">✓</div>
+        `;
+        historyListEl.appendChild(div);
+    });
+};
+
+historyBtn.addEventListener('click', () => {
+    renderHistory();
+    historyPanel.classList.remove('hidden');
+});
+
+closeHistoryBtn.addEventListener('click', () => {
+    historyPanel.classList.add('hidden');
+});
+
+clearHistoryBtn.addEventListener('click', () => {
+    if(confirm('Clear all local download history? Processing will restart from scratch.')) {
+        clearCatalog();
+        renderHistory();
+    }
+});
 
 // --- Helpers ---
 const generateGitRestoreScript = () => {
@@ -338,6 +387,9 @@ async function processProject(project, username, options) {
         processedCount++;
         statProcessed.textContent = processedCount;
         updateStatus(uiId, 'done', mode === 'individual' ? 'Saved' : 'Packaged');
+        
+        // Save to Catalog
+        addToCatalog(project);
 
     } catch (e) {
         console.error(`[Main] Error processing ${project.slug}:`, e);
@@ -354,6 +406,7 @@ async function startBackup() {
     const delay = parseInt(delayInput.value) || 3000;
     const skipForks = skipForksInput.checked;
     const includeHistory = includeHistoryInput.checked;
+    const skipArchived = skipArchivedInput.checked;
     
     const startDate = dateStartInput.value ? new Date(dateStartInput.value) : null;
     const endDate = dateEndInput.value ? new Date(dateEndInput.value) : null;
@@ -408,6 +461,15 @@ async function startBackup() {
 
             if (!project.id) {
                 updateStatus('unknown', 'error', 'Missing ID');
+                continue;
+            }
+
+            // 3. Archive/Catalog Filter
+            if (skipArchived && isArchived(project.id)) {
+                updateStatus(project.id, 'done', 'Already Archived (Skipped)');
+                // We do NOT increment 'processedCount' for the batch zip logic, 
+                // because it's not in THIS zip file.
+                // But we can visually indicate it's done.
                 continue;
             }
 

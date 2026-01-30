@@ -24,8 +24,24 @@
             <input type="text" id="username" placeholder="Enter username (e.g. @user)" autocomplete="off">
             <button id="start-btn">Start Backup</button>
             <button id="stop-btn" class="stop" disabled>Stop</button>
+            <button id="history-btn" class="secondary">History</button>
         </div>
     </header>
+
+    <!-- History Modal -->
+    <div id="history-panel" class="history-panel hidden">
+        <div class="history-header">
+            <h2>Local Archive History</h2>
+            <div style="display:flex; gap:1rem; align-items:center;">
+                <span id="history-stats" style="color:var(--text-dim); font-size:0.9rem;">0 items</span>
+                <button id="clear-history-btn" class="danger-sm">Clear History</button>
+                <button id="close-history-btn">Close</button>
+            </div>
+        </div>
+        <div id="history-list" class="history-list">
+            <!-- Populated by JS -->
+        </div>
+    </div>
 
     <div class="main-content">
         <div class="settings-panel">
@@ -56,6 +72,10 @@
                 <div class="setting-group checkbox-group">
                     <input type="checkbox" id="include-history">
                     <label for="include-history" style="cursor:pointer" title="Fetch all versions and create git script">Git History</label>
+                </div>
+                <div class="setting-group checkbox-group">
+                    <input type="checkbox" id="skip-archived" checked>
+                    <label for="skip-archived" style="cursor:pointer" title="Skip projects already in local catalog">Skip Archived</label>
                 </div>
             </div>
         </div>
