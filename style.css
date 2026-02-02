@@ -215,6 +215,7 @@ button.stop {
 }
 .status-icon.done { background: var(--success); color: white; }
 .status-icon.error { background: var(--error); color: white; }
+.status-icon.warning { background: var(--warning); color: var(--bg); }
 
 @keyframes pulse {
   0% { opacity: 1; }
@@ -241,6 +242,28 @@ button.stop {
   color: var(--text-dim);
   display: flex;
   gap: 1rem;
+}
+
+.project-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 0.5rem;
+}
+
+.skip-btn {
+    background: transparent;
+    border: 1px solid var(--warning);
+    color: var(--warning);
+    font-size: 0.7rem;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.skip-btn:hover {
+    background: var(--warning);
+    color: var(--bg);
 }
 
 .log-msg {

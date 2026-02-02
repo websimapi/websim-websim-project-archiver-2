@@ -24,8 +24,17 @@ async function mapLimit(items, limit, fn) {
         chunks.push(items.slice(i, i + limit));
     }
     for (const chunk of chunks) {
-        const chunkResults = await Promise.all(chunk.map(fn));
-        results.push(...chunkResults);
+        // Safety race to prevent chunks from hanging indefinitely
+        const chunkPromise = Promise.all(chunk.map(fn));
+        const chunkTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Asset Chunk Timeout")), 60000));
+        
+        try {
+            const chunkResults = await Promise.race([chunkPromise, chunkTimeout]);
+            results.push(...chunkResults);
+        } catch(e) {
+             console.warn("[WebSimAPI] Asset chunk failed/timed out:", e);
+             throw e;
+        }
     }
     return results;
 }

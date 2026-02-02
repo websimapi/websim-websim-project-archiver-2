@@ -11,10 +11,12 @@ let isRunning = false;
 let stopRequested = false;
 let foundProjects = [];
 let processedCount = 0;
+const projectSignals = {}; // Map<projectId, { skip: Function }>
 
 // Limits
 const CONCURRENCY_LIMIT = 3; // Number of simultaneous project fetches
-const PROJECT_TIMEOUT_MS = 1000 * 60 * 5; // 5 Minutes max per project
+const PROJECT_TIMEOUT_MS = 1000 * 60 * 10; // 10 Minutes max per project (Increased)
+const REVISION_TIMEOUT_MS = 1000 * 45; // 45 Seconds max per revision attempt
 const BATCH_SIZE_LIMIT = 450 * 1024 * 1024; // 450MB
 const PROJECT_SPLIT_LIMIT = 300 * 1024 * 1024; // 300MB
 
@@ -328,6 +330,9 @@ const createProjectElement = (project) => {
                 <span id="log-${safeId}" class="log-msg">Waiting...</span>
             </div>
         </div>
+        <div class="project-actions">
+            <button id="skip-rev-${safeId}" class="skip-btn" style="display:none;">Skip Rev</button>
+        </div>
     `;
     return el;
 };
@@ -342,9 +347,10 @@ const updateStatus = (projectId, status, msg) => {
     if (status === 'loading') icon.classList.add('loading');
     else if (status === 'done') icon.classList.add('done');
     else if (status === 'error') icon.classList.add('error');
+    else if (status === 'warning') icon.classList.add('warning');
     else icon.classList.add('pending');
 
-    icon.textContent = status === 'done' ? '✓' : (status === 'error' ? '!' : '●');
+    icon.textContent = status === 'done' ? '✓' : (status === 'error' ? '!' : (status === 'warning' ? '⚠' : '●'));
     log.textContent = msg;
 };
 
@@ -433,6 +439,15 @@ async function processProject(project, username, options) {
         if (includeHistory) {
             updateStatus(uiId, 'loading', 'Fetching revisions...');
             
+            // Setup Skip Button
+            const skipBtn = document.getElementById(`skip-rev-${uiId}`);
+            if (skipBtn) {
+                skipBtn.style.display = 'inline-block';
+                skipBtn.onclick = () => {
+                    if (projectSignals[uiId]?.skip) projectSignals[uiId].skip();
+                };
+            }
+
             // 1. Get All Revisions
             let revisions = await getAllProjectRevisions(project.id);
             if (!revisions || revisions.length === 0) {
@@ -466,43 +481,80 @@ async function processProject(project, username, options) {
                 const rev = revisions[i];
                 let vNum = rev.version ?? rev.revision_number ?? (i + 1);
                 
-                updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
+                updateStatus(uiId, 'loading', `Rev ${vNum} (${i+1}/${revisions.length})`);
                 
-                // Fetch & Retry Logic
                 let success = false;
                 let attempts = 0;
+                
                 while (!success && attempts < 3) {
                     attempts++;
+                    
+                    // Create Skip Signal
+                    let skipPromiseReject;
+                    const skipPromise = new Promise((_, reject) => {
+                        projectSignals[uiId] = { skip: () => reject(new Error("USER_SKIP")) };
+                        skipPromiseReject = reject;
+                    });
+                    
+                    // Create Timeout Signal
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error("REV_TIMEOUT")), REVISION_TIMEOUT_MS)
+                    );
+
                     try {
-                        const [assetList, htmlContent] = await Promise.all([
-                            getAssets(project.id, vNum),
-                            getProjectHtml(project.id, vNum)
-                        ]);
-                        
-                        const files = await processAssets(assetList, project.id, vNum);
-                        
-                        if (htmlContent) files['index.html'] = new TextEncoder().encode(htmlContent);
-                        else if (!files['index.html']) files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Missing -->`);
+                        // Work Task
+                        const taskPromise = (async () => {
+                            const [assetList, htmlContent] = await Promise.all([
+                                getAssets(project.id, vNum),
+                                getProjectHtml(project.id, vNum)
+                            ]);
+                            const files = await processAssets(assetList, project.id, vNum);
+                            
+                            if (htmlContent) files['index.html'] = new TextEncoder().encode(htmlContent);
+                            else if (!files['index.html']) files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Missing -->`);
+                            
+                            await writer.add(`${projectFolderName}/revisions/${vNum}`, files);
+                        })();
 
-                        // Write to abstract writer
-                        await writer.add(`${projectFolderName}/revisions/${vNum}`, files);
+                        // RACE: Task vs Skip vs Timeout
+                        await Promise.race([taskPromise, skipPromise, timeoutPromise]);
 
-                        // Log
+                        // Success Logic
                         const date = rev.created_at || new Date().toISOString();
                         const author = rev.created_by?.username || username || 'unknown';
                         const msg = (rev.title || rev.note || rev.description || `Version ${vNum}`).replace(/[\r\n|]+/g, ' ');
                         commitLog += `${vNum}|${date}|${author}|${msg}\n`;
-                        
                         success = true;
 
                     } catch (revError) {
-                         console.error(`[History] ⚠️ Rev ${vNum} failed:`, revError);
-                         if (attempts >= 3) commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED\n`;
-                         else await new Promise(r => setTimeout(r, 1000 * attempts));
+                        const isSkip = revError.message === "USER_SKIP";
+                        const isTimeout = revError.message === "REV_TIMEOUT";
+                        
+                        if (isSkip) {
+                            console.warn(`[History] Skipped Rev ${vNum} by user.`);
+                            commitLog += `${vNum}|${new Date().toISOString()}|system|SKIPPED_BY_USER\n`;
+                            success = true; // Treat as handled so we move to next rev
+                        } else {
+                            console.error(`[History] ⚠️ Rev ${vNum} attempt ${attempts} failed:`, revError);
+                            
+                            if (attempts >= 3 || isTimeout) {
+                                const reason = isTimeout ? "TIMEOUT" : "FAILED";
+                                commitLog += `${vNum}|${new Date().toISOString()}|system|${reason}\n`;
+                            }
+                            
+                            if (!success && attempts < 3 && !isSkip) {
+                                updateStatus(uiId, 'warning', `Retrying Rev ${vNum}...`);
+                                await new Promise(r => setTimeout(r, 2000));
+                            }
+                        }
+                    } finally {
+                        delete projectSignals[uiId];
                     }
                 }
             }
             
+            if (skipBtn) skipBtn.style.display = 'none';
+
             // Finalize
             if (mode === 'individual') {
                 await writer.finalize(commitLog, generateGitRestoreScript());
@@ -556,6 +608,10 @@ async function processProject(project, username, options) {
         console.error(`[Main] Error processing ${project.slug}:`, e);
         updateStatus(uiId, 'error', e.message.includes("Timeout") ? "Timed Out" : "Failed");
         throw e; // Propagate for concurrency pool
+    } finally {
+        const skipBtn = document.getElementById(`skip-rev-${uiId}`);
+        if (skipBtn) skipBtn.style.display = 'none';
+        delete projectSignals[uiId];
     }
 }
 
