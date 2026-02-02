@@ -13,6 +13,37 @@ let foundProjects = [];
 let processedCount = 0;
 let zip = null; // Used for Batch mode
 let currentZipSize = 0;
+let batchPart = 1;
+
+const BATCH_SIZE_LIMIT = 450 * 1024 * 1024; // 450MB Limit for Batch Parts
+const PROJECT_SPLIT_LIMIT = 300 * 1024 * 1024; // 300MB Limit for Single Project History Parts
+
+// --- Zip Queue (Background Processing) ---
+const zipQueue = {
+    queue: [],
+    processing: false,
+    add: function(task, uiId) {
+        this.queue.push({ task, uiId });
+        this.process();
+    },
+    process: async function() {
+        if (this.processing || this.queue.length === 0) return;
+        this.processing = true;
+        const { task, uiId } = this.queue.shift();
+        
+        try {
+            if (uiId) updateStatus(uiId, 'loading', 'Zipping (BG)...');
+            await task();
+            if (uiId) updateStatus(uiId, 'done', 'Saved');
+        } catch (e) {
+            console.error("Background zip task failed", e);
+            if (uiId) updateStatus(uiId, 'error', 'Zip Error');
+        } finally {
+            this.processing = false;
+            setTimeout(() => this.process(), 200);
+        }
+    }
+};
 
 // --- DOM Elements ---
 const usernameInput = document.getElementById('username');
@@ -236,46 +267,29 @@ async function processProject(project, username, options) {
     
     const { mode, rootZipFolder, includeHistory } = options;
     const uiId = project.id; 
+    let projectSizeEstimate = 0;
 
     console.log(`[Main] Processing project: ${project.id} (slug: ${project.slug})`);
     
     try {
-        // --- Setup Zip Target ---
-        const targetZip = mode === 'individual' ? new JSZip() : rootZipFolder;
         const projectFolderName = project.slug || project.id || `project_${project.id}`;
-        const outputFolder = mode === 'individual' ? targetZip : targetZip.folder(projectFolderName);
-
+        
         // --- PATH 1: Full History ---
         if (includeHistory) {
-            updateStatus(uiId, 'loading', 'Fetching all revisions...');
+            updateStatus(uiId, 'loading', 'Fetching revisions...');
             
             // 1. Get All Revisions
             let revisions = await getAllProjectRevisions(project.id);
             if (!revisions || revisions.length === 0) {
-                // Fallback if revisions list empty (shouldn't happen for valid projects)
-                console.warn(`[History] No revisions found via API, falling back to basic metadata.`);
-                
-                const fallbackVer = project.current_version || 
-                                    project.latest_version?.version || 
-                                    project.latest_revision?.version || 
-                                    1;
-
+                const fallbackVer = project.current_version || project.latest_version?.version || 1;
                 revisions = [{
-                    id: project.current_revision?.id,
-                    version: fallbackVer,
-                    created_at: project.created_at,
-                    created_by: project.created_by
+                    id: project.current_revision?.id, version: fallbackVer,
+                    created_at: project.created_at, created_by: project.created_by
                 }];
             }
-
-            // 2. Sort Revisions (Oldest -> Newest) for Git History
             revisions.sort((a, b) => (a.version || 0) - (b.version || 0));
             
-            if (revisions.length === 0) {
-                 throw new Error("No revisions found to archive.");
-            }
-
-            // Filter out duplicates based on version just in case
+            // Dedupe
             const uniqueRevisions = [];
             const seenVersions = new Set();
             for (const r of revisions) {
@@ -286,156 +300,164 @@ async function processProject(project, username, options) {
             }
             revisions = uniqueRevisions;
 
-            console.log(`[History] 🗓️ Found ${revisions.length} revisions. Range: ${revisions[0]?.version} -> ${revisions[revisions.length-1]?.version}`);
-            updateStatus(uiId, 'loading', `Found ${revisions.length} revs. Starting archive...`);
-
-            const revisionsFolder = outputFolder.folder('revisions');
+            console.log(`[History] Found ${revisions.length} revs for ${project.slug}`);
+            
+            // --- History Splitting Setup ---
+            let currentHistoryZip = mode === 'individual' ? new JSZip() : rootZipFolder;
+            let currentHistorySize = 0;
+            let partNumber = 1;
             let commitLog = "";
+            
+            // Helper to Flush Part (Individual Mode Only)
+            const flushPart = async (isFinal = false) => {
+                if (mode !== 'individual') return; 
+                
+                const suffix = (partNumber === 1 && isFinal) ? '' : `_part${partNumber}`;
+                const zipToSave = currentHistoryZip;
+                const pNum = partNumber;
+                
+                // Offload zipping to queue
+                zipQueue.add(async () => {
+                    console.log(`[ZipQueue] Starting zip for ${project.slug} (Part ${pNum})...`);
+                    const blob = await zipToSave.generateAsync({ type: "blob" });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `${username}_${projectFolderName}${suffix}.zip`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                }, isFinal ? uiId : null); // Only update UI to 'Done' on final part
+
+                if (!isFinal) {
+                    partNumber++;
+                    currentHistoryZip = new JSZip();
+                    currentHistorySize = 0;
+                }
+            };
 
             // 3. Loop Revisions
             for (let i = 0; i < revisions.length; i++) {
                 if (stopRequested) throw new Error("Stopped by user");
                 
                 const rev = revisions[i];
-                let vNum = rev.version;
-
-                // Robust version recovery
-                if (vNum === undefined || vNum === null) {
-                    if (rev.revision_number) vNum = rev.revision_number; // Alternative field
-                }
-                // Fallback to index if absolutely no version number (rare)
-                if (vNum === undefined || vNum === null) {
-                     vNum = i + 1;
-                     console.warn(`[History] Revision at index ${i} has no version number. Assigned ${vNum}.`);
-                }
+                let vNum = rev.version ?? rev.revision_number ?? (i + 1);
                 
                 updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
-                console.log(`[History] 💾 Processing Revision ${vNum} (ID: ${rev.id})...`);
-
-                // Retry Loop
+                
                 let success = false;
                 let attempts = 0;
-                const maxAttempts = 3; // Increased retry attempts
-
-                while (!success && attempts < maxAttempts) {
+                while (!success && attempts < 3) {
                     attempts++;
                     try {
-                        // A. Fetch Content - Sequentially to prevent race/hangs
                         const assetList = await getAssets(project.id, vNum);
                         const htmlContent = await getProjectHtml(project.id, vNum);
-
-                        // B. Process Assets
                         const files = await processAssets(assetList, project.id, vNum);
+                        
+                        if (htmlContent) files['index.html'] = new TextEncoder().encode(htmlContent);
+                        else if (!files['index.html']) files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Missing -->`);
 
-                        // C. Add HTML
-                        const hasIndex = Object.keys(files).some(k => k.toLowerCase() === 'index.html');
+                        // Determine folder path
+                        const baseFolder = mode === 'individual' 
+                            ? currentHistoryZip.folder('revisions').folder(String(vNum))
+                            : rootZipFolder.folder(projectFolderName).folder('revisions').folder(String(vNum));
 
-                        if (htmlContent) {
-                            files['index.html'] = new TextEncoder().encode(htmlContent);
-                        } else if (!hasIndex) {
-                             console.warn(`[History] Rev ${vNum}: No HTML found in assets or API. Creating placeholder.`);
-                             files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Source Missing (API 403/404) -->`);
-                        }
-
-                        // D. Write to Zip Folder
-                        const revFolder = revisionsFolder.folder(String(vNum));
+                        // Write Files & Calc Size
+                        let revSize = 0;
                         for (const [path, content] of Object.entries(files)) {
-                            revFolder.file(path.replace(/^\/+/, ''), content);
+                            baseFolder.file(path.replace(/^\/+/, ''), content);
+                            revSize += content.byteLength;
                         }
+                        
+                        currentHistorySize += revSize;
+                        projectSizeEstimate += revSize;
+                        if (mode === 'batch') currentZipSize += revSize;
 
-                        // E. Append to Commit Log
+                        // Log
                         const date = rev.created_at || new Date().toISOString();
                         const author = rev.created_by?.username || username || 'unknown';
-                        let msg = rev.title || rev.note || rev.description || `Version ${vNum}`;
-                        msg = msg.replace(/\|/g, '-').replace(/[\r\n]+/g, ' '); 
-                        
+                        const msg = (rev.title || rev.note || rev.description || `Version ${vNum}`).replace(/[\r\n|]+/g, ' ');
                         commitLog += `${vNum}|${date}|${author}|${msg}\n`;
+                        
                         success = true;
 
-                    } catch (revError) {
-                        console.error(`[History] ⚠️ Failed attempt ${attempts}/${maxAttempts} for Rev ${vNum}:`, revError);
-                        if (attempts >= maxAttempts) {
-                            console.error(`[History] ❌ Skipping Rev ${vNum} after ${maxAttempts} failures.`);
-                            // Give up on this revision but continue loop
-                            commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED_TO_ARCHIVE (Network/API Error)\n`;
-                        } else {
-                            // Backoff
-                            await new Promise(r => setTimeout(r, 1500 * attempts));
+                        // Check Split Limit (Individual Mode Only)
+                        if (mode === 'individual' && currentHistorySize > PROJECT_SPLIT_LIMIT) {
+                            console.log(`[Main] ✂️ Splitting history for ${project.slug} at rev ${vNum}`);
+                            currentHistoryZip.file("commit_log_part.txt", commitLog);
+                            await flushPart(false);
                         }
+
+                    } catch (revError) {
+                         console.error(`[History] ⚠️ Rev ${vNum} failed:`, revError);
+                         if (attempts >= 3) commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED\n`;
+                         else await new Promise(r => setTimeout(r, 1000 * attempts));
                     }
                 }
             }
-
-            // 4. Write Metadata & Scripts
-            outputFolder.file("commit_log.txt", commitLog);
-            outputFolder.file("restore_git.sh", generateGitRestoreScript(), { unixPermissions: "755" });
-
-        } 
-        // --- PATH 2: Latest Only (Legacy) ---
-        else {
-            updateStatus(uiId, 'loading', 'Fetching latest revision...');
-            console.log(`[Main] 🚀 Fetching LATEST version for ${project.id} (History skipped)`);
             
-            // 1. Resolve Version
-            let versionId = project.current_version;
-            if (versionId === undefined || versionId === null) {
-                versionId = project.latest_revision?.version || 
-                            project.latest_version?.version || 
-                            project.revision?.version;
+            // Finalize
+            if (mode === 'individual') {
+                currentHistoryZip.file("commit_log.txt", commitLog);
+                currentHistoryZip.file("restore_git.sh", generateGitRestoreScript(), { unixPermissions: "755" });
+                await flushPart(true);
+            } else {
+                 // Batch mode
+                 const pFolder = rootZipFolder.folder(projectFolderName);
+                 pFolder.file("commit_log.txt", commitLog);
+                 pFolder.file("restore_git.sh", generateGitRestoreScript(), { unixPermissions: "755" });
+                 updateStatus(uiId, 'done', 'Packaged');
             }
 
-            // Fallback: Fetch metadata
-            if (versionId === undefined || versionId === null) {
-                 console.log(`[Main] No numeric version for ${project.id}, fetching metadata...`);
+        } else {
+            // --- PATH 2: Latest Only ---
+            updateStatus(uiId, 'loading', 'Fetching latest...');
+            
+            let versionId = project.current_version ?? project.latest_revision?.version ?? project.revision?.version;
+            if (versionId == null) {
                  try {
                      const full = await getProjectById(project.id);
                      versionId = full?.current_version;
-                     if (versionId === undefined || versionId === null) {
-                         const revs = await getAllProjectRevisions(project.id);
-                         versionId = revs[0]?.version;
-                     }
-                 } catch(e) { console.warn("Meta fetch fail:", e); }
+                     if (versionId == null) versionId = (await getAllProjectRevisions(project.id))?.[0]?.version;
+                 } catch(e){}
             }
+            if (versionId == null) throw new Error('No numeric version found');
 
-            if (versionId === undefined || versionId === null) throw new Error('No numeric version found');
-            if (Number.isNaN(Number(versionId))) throw new Error(`Invalid version number: ${versionId}`);
-
-            // 2. Download
-            updateStatus(uiId, 'loading', 'Downloading assets...');
             const [assetList, htmlContent] = await Promise.all([
                 getAssets(project.id, versionId),
                 getProjectHtml(project.id, versionId)
             ]);
 
             const files = await processAssets(assetList, project.id, versionId);
-
-            const htmlBuffer = htmlContent 
-                ? new TextEncoder().encode(htmlContent)
-                : new TextEncoder().encode(`<html><body><h1>${project.title}</h1><p>Source unavailable.</p></body></html>`);
+            const htmlBuffer = htmlContent ? new TextEncoder().encode(htmlContent) : new TextEncoder().encode(`<!-- Source missing -->`);
             files['index.html'] = htmlBuffer;
 
-            // 3. Write
+            // Prepare Zip
+            const target = mode === 'individual' ? new JSZip() : rootZipFolder.folder(projectFolderName);
+            
+            let size = 0;
             for (const [path, content] of Object.entries(files)) {
-                outputFolder.file(path.replace(/^\/+/, ''), content);
+                target.file(path.replace(/^\/+/, ''), content);
+                size += content.byteLength;
             }
-        }
-
-        // --- Finalize Individual Zip ---
-        if (mode === 'individual') {
-            updateStatus(uiId, 'loading', 'Zipping...');
-            const blob = await targetZip.generateAsync({ type: "blob" });
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = `${username}_${projectFolderName}.zip`;
-            a.click();
-            URL.revokeObjectURL(a.href);
+            
+            if (mode === 'batch') {
+                currentZipSize += size;
+                updateStatus(uiId, 'done', 'Packaged');
+            } else {
+                // Individual Mode - Queue zipping
+                updateStatus(uiId, 'loading', 'Queued for Zip');
+                zipQueue.add(async () => {
+                    const blob = await target.generateAsync({ type: "blob" });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `${username}_${projectFolderName}.zip`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                }, uiId);
+            }
         }
 
         processedCount++;
         statProcessed.textContent = processedCount;
-        updateStatus(uiId, 'done', mode === 'individual' ? 'Saved' : 'Packaged');
-        
-        // Save to Catalog
         addToCatalog(project);
 
     } catch (e) {
@@ -497,6 +519,8 @@ async function startBackup(isResume = false) {
     isRunning = true;
     stopRequested = false;
     foundProjects = [];
+    batchPart = 1;
+    currentZipSize = 0;
     
     let startCursor = null;
 
@@ -507,7 +531,6 @@ async function startBackup(isResume = false) {
             processedCount = resumeData.processedCount || 0;
             console.log(`[Main] Resuming from cursor: ${startCursor} (Previously processed: ${processedCount})`);
         }
-        // Don't clear stats completely if resuming, to show progress continues
     } else {
         processedCount = 0;
         clearResumeState(username);
@@ -517,7 +540,7 @@ async function startBackup(isResume = false) {
         statSize.textContent = '0 Bytes';
     }
 
-    zip = new JSZip(); // Always init for potential Batch usage (Note: Resume in Batch mode will create a NEW zip, not append)
+    zip = new JSZip();
 
     startBtn.disabled = true;
     resumeBtn.disabled = true;
@@ -526,8 +549,6 @@ async function startBackup(isResume = false) {
     usernameInput.disabled = true;
 
     try {
-        const userFolder = zip.folder(username);
-        
         const onCursorSaved = (nextCursor) => {
             saveResumeState(username, nextCursor, processedCount);
         };
@@ -538,21 +559,17 @@ async function startBackup(isResume = false) {
             if (stopRequested) break;
 
             // --- FILTERING LOGIC ---
-            
-            // 1. Date Filter
             if (startDate || endDate) {
-                const pDate = new Date(project.created_at); // or updated_at? Usually creation for archive.
+                const pDate = new Date(project.created_at);
                 if (startDate && pDate < startDate) continue;
                 if (endDate && pDate > endDate) continue;
             }
 
-            // 2. Fork Filter
             if (skipForks && project.parent_id) {
-                console.log(`[Main] Skipping fork: ${project.slug} (Parent: ${project.parent_id})`);
+                console.log(`[Main] Skipping fork: ${project.slug}`);
                 continue;
             }
 
-            console.log(`[Main] Discovered project: ${project.id}`);
             foundProjects.push(project);
             statTotal.textContent = foundProjects.length;
             
@@ -564,19 +581,43 @@ async function startBackup(isResume = false) {
                 continue;
             }
 
-            // 3. Archive/Catalog Filter
             if (skipArchived && isArchived(project.id)) {
-                updateStatus(project.id, 'done', 'Already Archived (Skipped)');
-                // We do NOT increment 'processedCount' for the batch zip logic, 
-                // because it's not in THIS zip file.
-                // But we can visually indicate it's done.
+                updateStatus(project.id, 'done', 'Skipped (Archived)');
                 continue;
             }
+
+            // --- Batch Splitting Logic ---
+            if (mode === 'batch' && currentZipSize > BATCH_SIZE_LIMIT) {
+                console.log(`[Main] 📦 Batch limit reached (${formatBytes(currentZipSize)}). Saving Part ${batchPart}...`);
+                
+                const saveLabel = `Saving Part ${batchPart}...`;
+                const oldText = startBtn.textContent;
+                startBtn.textContent = saveLabel;
+                updateStatus(project.id, 'pending', 'Waiting for Batch Split...');
+
+                const content = await zip.generateAsync({ type: "blob" });
+                
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(content);
+                a.download = `${username}_backup_part${batchPart}.zip`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+                
+                batchPart++;
+                zip = new JSZip(); 
+                currentZipSize = 0;
+                startBtn.textContent = oldText;
+                
+                await new Promise(r => setTimeout(r, 1000));
+            }
+
+            // Get Fresh User Folder (Linked to Current Zip)
+            const currentUserFolder = zip.folder(username);
 
             // Process
             await processProject(project, username, {
                 mode: mode,
-                rootZipFolder: userFolder,
+                rootZipFolder: currentUserFolder,
                 includeHistory: includeHistory
             });
             
