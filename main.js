@@ -6,6 +6,7 @@ import { getAllProjectRevisions, getProjectById, getProjectBySlug } from './api_
 import { addToCatalog, isArchived, getCatalogAsArray, clearCatalog } from './catalog.js';
 
 // --- State ---
+const SETTINGS_KEY = 'websim_archiver_settings';
 let isRunning = false;
 let stopRequested = false;
 let foundProjects = [];
@@ -270,52 +271,61 @@ async function processProject(project, username, options) {
                 updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
                 console.log(`[History] 💾 Processing Revision ${vNum} (ID: ${rev.id})...`);
 
-                try {
-                    // A. Fetch Content
-                    // Note: We await sequentially to be polite to the API and filesystem
-                    const [assetList, htmlContent] = await Promise.all([
-                        getAssets(project.id, vNum),
-                        getProjectHtml(project.id, vNum)
-                    ]);
+                // Retry Loop
+                let success = false;
+                let attempts = 0;
+                const maxAttempts = 2; // Try up to 2 times
 
-                    // B. Process Assets
-                    const files = await processAssets(assetList, project.id, vNum);
+                while (!success && attempts < maxAttempts) {
+                    attempts++;
+                    try {
+                        // A. Fetch Content
+                        const [assetList, htmlContent] = await Promise.all([
+                            getAssets(project.id, vNum),
+                            getProjectHtml(project.id, vNum)
+                        ]);
 
-                    // C. Add HTML
-                    // Check if index.html was already obtained from assets to avoid overwriting with placeholder
-                    const hasIndex = Object.keys(files).some(k => k.toLowerCase() === 'index.html');
+                        // B. Process Assets
+                        const files = await processAssets(assetList, project.id, vNum);
 
-                    if (htmlContent) {
-                        files['index.html'] = new TextEncoder().encode(htmlContent);
-                    } else if (!hasIndex) {
-                         // Only write placeholder if we truly have no index.html from assets or API
-                         console.warn(`[History] Rev ${vNum}: No HTML found in assets or API. Creating placeholder.`);
-                         files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Source Missing (API 403/404) -->`);
+                        // C. Add HTML
+                        const hasIndex = Object.keys(files).some(k => k.toLowerCase() === 'index.html');
+
+                        if (htmlContent) {
+                            files['index.html'] = new TextEncoder().encode(htmlContent);
+                        } else if (!hasIndex) {
+                             console.warn(`[History] Rev ${vNum}: No HTML found in assets or API. Creating placeholder.`);
+                             files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Source Missing (API 403/404) -->`);
+                        }
+
+                        // D. Write to Zip Folder
+                        const revFolder = revisionsFolder.folder(String(vNum));
+                        for (const [path, content] of Object.entries(files)) {
+                            revFolder.file(path.replace(/^\/+/, ''), content);
+                        }
+
+                        // E. Append to Commit Log
+                        const date = rev.created_at || new Date().toISOString();
+                        const author = rev.created_by?.username || username || 'unknown';
+                        let msg = rev.title || rev.note || rev.description || `Version ${vNum}`;
+                        msg = msg.replace(/\|/g, '-').replace(/[\r\n]+/g, ' '); 
+                        
+                        commitLog += `${vNum}|${date}|${author}|${msg}\n`;
+                        success = true;
+
+                        // Breathe
+                        await new Promise(r => setTimeout(r, 100));
+
+                    } catch (revError) {
+                        console.error(`[History] ⚠️ Failed attempt ${attempts}/${maxAttempts} for Rev ${vNum}:`, revError);
+                        if (attempts >= maxAttempts) {
+                            // Give up on this revision but continue loop
+                            commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED_TO_ARCHIVE\n`;
+                        } else {
+                            // Backoff
+                            await new Promise(r => setTimeout(r, 1000 * attempts));
+                        }
                     }
-
-                    // D. Write to Zip Folder: revisions/VERSION/
-                    const revFolder = revisionsFolder.folder(String(vNum));
-                    for (const [path, content] of Object.entries(files)) {
-                        revFolder.file(path.replace(/^\/+/, ''), content);
-                    }
-
-                    // E. Append to Commit Log
-                    // Format: VERSION|ISO_DATE|AUTHOR|MESSAGE
-                    const date = rev.created_at || new Date().toISOString();
-                    const author = rev.created_by?.username || username || 'unknown';
-                    // Sanitize message
-                    let msg = rev.title || rev.note || rev.description || `Version ${vNum}`;
-                    msg = msg.replace(/\|/g, '-').replace(/[\r\n]+/g, ' '); 
-                    
-                    commitLog += `${vNum}|${date}|${author}|${msg}\n`;
-
-                    // Tiny delay to breathe
-                    await new Promise(r => setTimeout(r, 100));
-
-                } catch (revError) {
-                    console.error(`[History] ⚠️ Failed to archive Revision ${vNum}:`, revError);
-                    // We continue to the next revision instead of failing the whole project
-                    commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED_TO_ARCHIVE\n`;
                 }
             }
 
@@ -397,7 +407,40 @@ async function processProject(project, username, options) {
     }
 }
 
+function saveSettings() {
+    const settings = {
+        username: usernameInput.value,
+        dateStart: dateStartInput.value,
+        dateEnd: dateEndInput.value,
+        downloadMode: downloadModeInput.value,
+        delay: delayInput.value,
+        skipForks: skipForksInput.checked,
+        includeHistory: includeHistoryInput.checked,
+        skipArchived: skipArchivedInput.checked
+    };
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch(e){}
+}
+
+function loadSettings() {
+    try {
+        const raw = localStorage.getItem(SETTINGS_KEY);
+        if (!raw) return;
+        const s = JSON.parse(raw);
+        if (s.username) usernameInput.value = s.username;
+        if (s.dateStart) dateStartInput.value = s.dateStart;
+        if (s.dateEnd) dateEndInput.value = s.dateEnd;
+        if (s.downloadMode) downloadModeInput.value = s.downloadMode;
+        if (s.delay) delayInput.value = s.delay;
+        if (s.skipForks !== undefined) skipForksInput.checked = s.skipForks;
+        if (s.includeHistory !== undefined) includeHistoryInput.checked = s.includeHistory;
+        if (s.skipArchived !== undefined) skipArchivedInput.checked = s.skipArchived;
+    } catch(e) {
+        console.warn("Failed to load settings", e);
+    }
+}
+
 async function startBackup() {
+    saveSettings();
     const username = usernameInput.value.trim().replace('@', '');
     if (!username) return alert('Please enter a username');
 
@@ -547,3 +590,5 @@ stopBtn.addEventListener('click', () => {
         stopBtn.disabled = true;
     }
 });
+
+loadSettings();

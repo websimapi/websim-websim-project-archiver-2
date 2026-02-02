@@ -124,6 +124,7 @@ export async function processAssets(assetList, projectId, version) {
     }
 
     const processItem = async (asset) => {
+      try {
         if (!asset.path) return;
         
         const path = asset.path.replace(/^(\.|\/)+/, ''); // Clean path
@@ -200,7 +201,12 @@ export async function processAssets(assetList, projectId, version) {
                 // Jitter to avoid rate limits
                 await new Promise(r => setTimeout(r, Math.random() * 50));
                 
-                const res = await fetch(url);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout for individual assets
+
+                const res = await fetch(url, { signal: controller.signal });
+                clearTimeout(timeoutId);
+
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 
                 const blob = await res.arrayBuffer();
@@ -263,6 +269,9 @@ export async function processAssets(assetList, projectId, version) {
                  console.error("Critical: Failed to fetch index.html");
              }
         }
+      } catch (err) {
+          console.error(`[WebSimAPI] Safe catch in processItem for ${asset.path}:`, err);
+      }
     };
 
     // Limit concurrency

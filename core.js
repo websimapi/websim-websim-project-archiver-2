@@ -5,16 +5,22 @@ export async function makeRequest(endpoint, options = {}) {
     const method = options.method || 'GET';
     const start = Date.now();
     
+    // Default 30s timeout to prevent hangs
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    
     console.log(`[WebSimAPI] 🔵 ${method} ${url}`);
     
     try {
         const response = await fetch(url, {
             ...options,
+            signal: controller.signal,
             headers: {
                 'Content-Type': 'application/json',
                 ...options.headers
             }
         });
+        clearTimeout(timeoutId);
         
         const ms = Date.now() - start;
 
@@ -53,7 +59,15 @@ export async function makeRequest(endpoint, options = {}) {
 }
 
 export async function fetchRaw(endpoint) {
-    const response = await fetch(`${API_BASE}${endpoint}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.arrayBuffer();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+        const response = await fetch(`${API_BASE}${endpoint}`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.arrayBuffer();
+    } catch(e) {
+        clearTimeout(timeoutId);
+        throw e;
+    }
 }

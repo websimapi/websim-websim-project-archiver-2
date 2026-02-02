@@ -11,7 +11,14 @@ export async function getProjectHtml(projectId, version) {
     // This is more reliable as the dedicated /html endpoint often returns 403
     try {
         console.log(`[API] Fetching revision metadata for HTML...`);
-        const response = await fetch(`${API_BASE}/projects/${projectId}/revisions/${version}`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 20000);
+        
+        const response = await fetch(`${API_BASE}/projects/${projectId}/revisions/${version}`, {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
         if (response.ok) {
             const data = await response.json();
             const rev = data.revision || data; // Handle nested or flat return
@@ -40,8 +47,14 @@ export async function getProjectHtml(projectId, version) {
     try {
         console.log(`[API] Attempting fallback to direct HTML endpoint...`);
         // Remove Content-Type header to avoid 403 on some endpoints
-        const response = await fetch(`${API_BASE}/projects/${projectId}/revisions/${version}/html`);
-        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 20000);
+
+        const response = await fetch(`${API_BASE}/projects/${projectId}/revisions/${version}/html`, {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
         if (response.ok) {
             const text = await response.text();
             if (text.trim().startsWith('{')) {
