@@ -17,6 +17,7 @@ let currentZipSize = 0;
 // --- DOM Elements ---
 const usernameInput = document.getElementById('username');
 const startBtn = document.getElementById('start-btn');
+const resumeBtn = document.getElementById('resume-btn');
 const stopBtn = document.getElementById('stop-btn');
 const projectListEl = document.getElementById('project-list');
 const statTotal = document.getElementById('stat-total');
@@ -78,6 +79,46 @@ clearHistoryBtn.addEventListener('click', () => {
         renderHistory();
     }
 });
+
+// --- Resume Helper ---
+const getResumeKey = (user) => `websim_archiver_resume_${user}`;
+
+const checkResumeState = () => {
+    const user = usernameInput.value.trim().replace('@', '');
+    if (!user) {
+        resumeBtn.style.display = 'none';
+        return;
+    }
+    const raw = localStorage.getItem(getResumeKey(user));
+    if (raw) {
+        try {
+            const data = JSON.parse(raw);
+            if (data.cursor) {
+                resumeBtn.style.display = 'inline-block';
+                resumeBtn.textContent = `Resume (${data.processedCount || '?'} Done)`;
+                return;
+            }
+        } catch(e) {}
+    }
+    resumeBtn.style.display = 'none';
+};
+
+const saveResumeState = (user, cursor, count) => {
+    if (!user || !cursor) return;
+    localStorage.setItem(getResumeKey(user), JSON.stringify({
+        cursor,
+        processedCount: count,
+        timestamp: Date.now()
+    }));
+};
+
+const clearResumeState = (user) => {
+    localStorage.removeItem(getResumeKey(user));
+    checkResumeState();
+};
+
+usernameInput.addEventListener('input', checkResumeState);
+usernameInput.addEventListener('change', checkResumeState);
 
 // --- Helpers ---
 const generateGitRestoreScript = () => {
@@ -274,16 +315,14 @@ async function processProject(project, username, options) {
                 // Retry Loop
                 let success = false;
                 let attempts = 0;
-                const maxAttempts = 2; // Try up to 2 times
+                const maxAttempts = 3; // Increased retry attempts
 
                 while (!success && attempts < maxAttempts) {
                     attempts++;
                     try {
-                        // A. Fetch Content
-                        const [assetList, htmlContent] = await Promise.all([
-                            getAssets(project.id, vNum),
-                            getProjectHtml(project.id, vNum)
-                        ]);
+                        // A. Fetch Content - Sequentially to prevent race/hangs
+                        const assetList = await getAssets(project.id, vNum);
+                        const htmlContent = await getProjectHtml(project.id, vNum);
 
                         // B. Process Assets
                         const files = await processAssets(assetList, project.id, vNum);
@@ -313,17 +352,15 @@ async function processProject(project, username, options) {
                         commitLog += `${vNum}|${date}|${author}|${msg}\n`;
                         success = true;
 
-                        // Breathe
-                        await new Promise(r => setTimeout(r, 100));
-
                     } catch (revError) {
                         console.error(`[History] ⚠️ Failed attempt ${attempts}/${maxAttempts} for Rev ${vNum}:`, revError);
                         if (attempts >= maxAttempts) {
+                            console.error(`[History] ❌ Skipping Rev ${vNum} after ${maxAttempts} failures.`);
                             // Give up on this revision but continue loop
-                            commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED_TO_ARCHIVE\n`;
+                            commitLog += `${vNum}|${new Date().toISOString()}|system|FAILED_TO_ARCHIVE (Network/API Error)\n`;
                         } else {
                             // Backoff
-                            await new Promise(r => setTimeout(r, 1000 * attempts));
+                            await new Promise(r => setTimeout(r, 1500 * attempts));
                         }
                     }
                 }
@@ -439,7 +476,7 @@ function loadSettings() {
     }
 }
 
-async function startBackup() {
+async function startBackup(isResume = false) {
     saveSettings();
     const username = usernameInput.value.trim().replace('@', '');
     if (!username) return alert('Please enter a username');
@@ -456,26 +493,46 @@ async function startBackup() {
 
     console.log(`[Main] Backup config: User=${username}, Mode=${mode}, Delay=${delay}, SkipForks=${skipForks}`);
 
-    // Reset UI
+    // Reset UI & Resume Logic
     isRunning = true;
     stopRequested = false;
     foundProjects = [];
-    processedCount = 0;
-    zip = new JSZip(); // Always init for potential Batch usage
     
-    projectListEl.innerHTML = '';
-    statTotal.textContent = '0';
-    statProcessed.textContent = '0';
-    statSize.textContent = '0 Bytes';
-    
+    let startCursor = null;
+
+    if (isResume) {
+        const resumeData = JSON.parse(localStorage.getItem(getResumeKey(username)) || '{}');
+        if (resumeData.cursor) {
+            startCursor = resumeData.cursor;
+            processedCount = resumeData.processedCount || 0;
+            console.log(`[Main] Resuming from cursor: ${startCursor} (Previously processed: ${processedCount})`);
+        }
+        // Don't clear stats completely if resuming, to show progress continues
+    } else {
+        processedCount = 0;
+        clearResumeState(username);
+        projectListEl.innerHTML = '';
+        statTotal.textContent = '0';
+        statProcessed.textContent = '0';
+        statSize.textContent = '0 Bytes';
+    }
+
+    zip = new JSZip(); // Always init for potential Batch usage (Note: Resume in Batch mode will create a NEW zip, not append)
+
     startBtn.disabled = true;
+    resumeBtn.disabled = true;
     stopBtn.disabled = false;
     stopBtn.textContent = (mode === 'batch') ? "Stop & Save" : "Stop";
     usernameInput.disabled = true;
 
     try {
         const userFolder = zip.folder(username);
-        const generator = getAllUserProjectsGenerator(username);
+        
+        const onCursorSaved = (nextCursor) => {
+            saveResumeState(username, nextCursor, processedCount);
+        };
+
+        const generator = getAllUserProjectsGenerator(username, startCursor, onCursorSaved);
         
         for await (const project of generator) {
             if (stopRequested) break;
@@ -525,18 +582,24 @@ async function startBackup() {
             
             // Rate Limit
             if (delay > 0) {
-                console.log(`[Main] Waiting ${delay}ms...`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
 
     } catch (e) {
         console.error("[Main] Loop error:", e);
-        alert(`Error: ${e.message}`);
+        // Add visual error to top of list
+        const errDiv = document.createElement('div');
+        errDiv.className = 'project-item';
+        errDiv.style.borderColor = 'var(--error)';
+        errDiv.innerHTML = `<div class="status-icon error">!</div> <div><strong>Scan Stopped</strong><br>Error: ${e.message}</div>`;
+        projectListEl.prepend(errDiv);
     } finally {
         finishBackup(mode);
     }
 }
+
+resumeBtn.addEventListener('click', () => startBackup(true));
 
 async function finishBackup(mode) {
     isRunning = false;
@@ -592,3 +655,4 @@ stopBtn.addEventListener('click', () => {
 });
 
 loadSettings();
+checkResumeState();

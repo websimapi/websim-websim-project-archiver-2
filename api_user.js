@@ -10,12 +10,14 @@ export async function getUserProjects(username, cursor = null) {
     return makeRequest(`/users/${username}/projects?${params.toString()}`);
 }
 
-export async function* getAllUserProjectsGenerator(username) {
+export async function* getAllUserProjectsGenerator(username, startCursor = null, onCursorSaved = null) {
     let hasNext = true;
-    let cursor = null;
+    let cursor = startCursor;
     let pageCount = 0;
-    const MAX_PAGES = 1000; // Safety cap
+    const MAX_PAGES = 2000; // Increased safety cap
     
+    console.log(`[API-User] Generator started for ${username}. Start Cursor: ${cursor || 'INITIAL'}`);
+
     while(hasNext && pageCount < MAX_PAGES) {
         console.log(`[API-User] Fetching page ${pageCount}, cursor: ${cursor}`);
         try {
@@ -54,6 +56,8 @@ export async function* getAllUserProjectsGenerator(username) {
 
             if (meta && meta.has_next_page && meta.end_cursor) {
                 cursor = meta.end_cursor;
+                // Notify main app to save this cursor for resume capability
+                if (onCursorSaved) onCursorSaved(cursor);
             } else {
                 console.log(`[API-User] No more pages available (meta.has_next_page=${meta?.has_next_page}).`);
                 hasNext = false;
@@ -61,8 +65,8 @@ export async function* getAllUserProjectsGenerator(username) {
 
         } catch (e) {
             console.error("[API-User] Error fetching user projects page:", e);
-            // Don't crash the whole process on one failed page, but maybe stop iteration?
-            // Throwing allows main.js to catch it.
+            // If a page fails, we try to wait and retry once before throwing?
+            // For now, we throw to let main loop handle retry or stop.
             throw e;
         }
         pageCount++;

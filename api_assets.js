@@ -202,7 +202,7 @@ export async function processAssets(assetList, projectId, version) {
                 await new Promise(r => setTimeout(r, Math.random() * 50));
                 
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout for individual assets
+                const timeoutId = setTimeout(() => controller.abort(), 25000); // Increased timeout
 
                 const res = await fetch(url, { signal: controller.signal });
                 clearTimeout(timeoutId);
@@ -274,7 +274,7 @@ export async function processAssets(assetList, projectId, version) {
       }
     };
 
-    // Limit concurrency
-    await mapLimit(assetList, 5, processItem);
+    // Limit concurrency - Reduced to 3 to prevent "hanging" due to connection limits/stalls
+    await mapLimit(assetList, 3, processItem);
     return files;
 }
