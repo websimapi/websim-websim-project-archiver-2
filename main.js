@@ -11,14 +11,102 @@ let isRunning = false;
 let stopRequested = false;
 let foundProjects = [];
 let processedCount = 0;
-let zip = null; // Used for Batch mode
-let currentZipSize = 0;
-let batchPart = 1;
 
-const BATCH_SIZE_LIMIT = 450 * 1024 * 1024; // 450MB Limit for Batch Parts
-const PROJECT_SPLIT_LIMIT = 300 * 1024 * 1024; // 300MB Limit for Single Project History Parts
+// Limits
+const CONCURRENCY_LIMIT = 3; // Number of simultaneous project fetches
+const PROJECT_TIMEOUT_MS = 1000 * 60 * 5; // 5 Minutes max per project
+const BATCH_SIZE_LIMIT = 450 * 1024 * 1024; // 450MB
+const PROJECT_SPLIT_LIMIT = 300 * 1024 * 1024; // 300MB
 
-// --- Zip Queue (Background Processing) ---
+// --- Batch Management ---
+// Handles thread-safe access to the shared zip for Batch Mode
+const batchManager = {
+    zip: null,
+    currentSize: 0,
+    part: 1,
+    locked: false,
+    username: 'backup',
+    btnRef: null,
+
+    init(username, btnElement) {
+        this.zip = new JSZip();
+        this.currentSize = 0;
+        this.part = 1;
+        this.locked = false;
+        this.username = username;
+        this.btnRef = btnElement;
+    },
+
+    async addFiles(pathPrefix, files) {
+        // Simple Mutex to prevent race conditions during size checks/splitting
+        while(this.locked) await new Promise(r => setTimeout(r, 100));
+        this.locked = true;
+
+        try {
+            let addedSize = 0;
+            for(const c of Object.values(files)) addedSize += c.byteLength;
+
+            // Check Split
+            if (this.currentSize + addedSize > BATCH_SIZE_LIMIT) {
+                await this.flush();
+            }
+
+            // Write
+            const folder = this.zip.folder(pathPrefix);
+            for(const [path, content] of Object.entries(files)) {
+                folder.file(path, content);
+            }
+            this.currentSize += addedSize;
+        } finally {
+            this.locked = false;
+        }
+    },
+
+    async flush() {
+        console.log(`[Batch] 📦 Splitting Batch Part ${this.part}...`);
+        if (this.btnRef) this.btnRef.textContent = `Saving Part ${this.part}...`;
+        
+        try {
+            const content = await this.zip.generateAsync({ type: "blob" });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(content);
+            a.download = `${this.username}_part${this.part}.zip`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        } catch(e) {
+            console.error("[Batch] Flush failed:", e);
+        }
+
+        this.part++;
+        this.zip = new JSZip();
+        this.currentSize = 0;
+        
+        // Brief pause to let UI/Browser catch up
+        await new Promise(r => setTimeout(r, 1000));
+    },
+
+    async finish(statElement) {
+        if (this.currentSize === 0) return;
+        while(this.locked) await new Promise(r => setTimeout(r, 100));
+        this.locked = true;
+        
+        if (this.btnRef) this.btnRef.textContent = "Saving Final Zip...";
+        try {
+            const content = await this.zip.generateAsync({ type: "blob" }, (meta) => {
+                if (statElement) statElement.textContent = `Zipping: ${meta.percent.toFixed(1)}%`;
+            });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(content);
+            a.download = `${this.username}_final_part${this.part}.zip`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        } finally {
+            this.locked = false;
+        }
+    }
+};
+
+// --- Zip Queue (Background Processing for Individual Mode) ---
 const zipQueue = {
     queue: [],
     processing: false,
@@ -262,12 +350,79 @@ const updateStatus = (projectId, status, msg) => {
 
 // --- Core Logic ---
 
+// Helper: Timeout Wrapper
+const withTimeout = (promise, ms) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
+]);
+
 async function processProject(project, username, options) {
     if (stopRequested) return;
     
-    const { mode, rootZipFolder, includeHistory } = options;
+    const { mode, includeHistory } = options;
     const uiId = project.id; 
-    let projectSizeEstimate = 0;
+
+    // Define a Writer Interface
+    // Abstracts away whether we are writing to a local zip (Individual) or shared batch (Batch)
+    let writer;
+
+    if (mode === 'batch') {
+        writer = {
+            add: async (pathPrefix, files) => {
+                await batchManager.addFiles(`${username}/${pathPrefix}`, files);
+            },
+            savePart: async (data, suffix) => { /* Managed by batchManager internally */ }
+        };
+    } else {
+        // Individual Mode Writer
+        let localZip = new JSZip();
+        let localSize = 0;
+        let localPart = 1;
+        
+        writer = {
+            add: async (pathPrefix, files) => {
+                const folder = localZip.folder(pathPrefix);
+                let addedSize = 0;
+                for (const [p, c] of Object.entries(files)) {
+                    folder.file(p, c);
+                    addedSize += c.byteLength;
+                }
+                localSize += addedSize;
+                
+                // History Split Check (Only for Individual Mode)
+                if (localSize > PROJECT_SPLIT_LIMIT) {
+                    await writer.flushPart(false);
+                }
+            },
+            flushPart: async (isFinal, commitLogData) => {
+                if (commitLogData) localZip.file("commit_log_part.txt", commitLogData);
+                
+                const suffix = (localPart === 1 && isFinal) ? '' : `_part${localPart}`;
+                const zipToSave = localZip; // Capture current
+                const pNum = localPart;
+
+                zipQueue.add(async () => {
+                    const blob = await zipToSave.generateAsync({ type: "blob" });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `${username}_${project.slug || project.id}${suffix}.zip`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                }, isFinal ? uiId : null);
+
+                if (!isFinal) {
+                    localPart++;
+                    localZip = new JSZip(); // Reset
+                    localSize = 0;
+                }
+            },
+            finalize: async (commitLogData, restoreScript) => {
+                if (commitLogData) localZip.file("commit_log.txt", commitLogData);
+                if (restoreScript) localZip.file("restore_git.sh", restoreScript, { unixPermissions: "755" });
+                await writer.flushPart(true);
+            }
+        };
+    }
 
     console.log(`[Main] Processing project: ${project.id} (slug: ${project.slug})`);
     
@@ -302,38 +457,8 @@ async function processProject(project, username, options) {
 
             console.log(`[History] Found ${revisions.length} revs for ${project.slug}`);
             
-            // --- History Splitting Setup ---
-            let currentHistoryZip = mode === 'individual' ? new JSZip() : rootZipFolder;
-            let currentHistorySize = 0;
-            let partNumber = 1;
             let commitLog = "";
             
-            // Helper to Flush Part (Individual Mode Only)
-            const flushPart = async (isFinal = false) => {
-                if (mode !== 'individual') return; 
-                
-                const suffix = (partNumber === 1 && isFinal) ? '' : `_part${partNumber}`;
-                const zipToSave = currentHistoryZip;
-                const pNum = partNumber;
-                
-                // Offload zipping to queue
-                zipQueue.add(async () => {
-                    console.log(`[ZipQueue] Starting zip for ${project.slug} (Part ${pNum})...`);
-                    const blob = await zipToSave.generateAsync({ type: "blob" });
-                    const a = document.createElement('a');
-                    a.href = URL.createObjectURL(blob);
-                    a.download = `${username}_${projectFolderName}${suffix}.zip`;
-                    a.click();
-                    URL.revokeObjectURL(a.href);
-                }, isFinal ? uiId : null); // Only update UI to 'Done' on final part
-
-                if (!isFinal) {
-                    partNumber++;
-                    currentHistoryZip = new JSZip();
-                    currentHistorySize = 0;
-                }
-            };
-
             // 3. Loop Revisions
             for (let i = 0; i < revisions.length; i++) {
                 if (stopRequested) throw new Error("Stopped by user");
@@ -343,33 +468,24 @@ async function processProject(project, username, options) {
                 
                 updateStatus(uiId, 'loading', `Archiving Rev ${vNum} (${i+1}/${revisions.length})`);
                 
+                // Fetch & Retry Logic
                 let success = false;
                 let attempts = 0;
                 while (!success && attempts < 3) {
                     attempts++;
                     try {
-                        const assetList = await getAssets(project.id, vNum);
-                        const htmlContent = await getProjectHtml(project.id, vNum);
+                        const [assetList, htmlContent] = await Promise.all([
+                            getAssets(project.id, vNum),
+                            getProjectHtml(project.id, vNum)
+                        ]);
+                        
                         const files = await processAssets(assetList, project.id, vNum);
                         
                         if (htmlContent) files['index.html'] = new TextEncoder().encode(htmlContent);
                         else if (!files['index.html']) files['index.html'] = new TextEncoder().encode(`<!-- Version ${vNum}: Missing -->`);
 
-                        // Determine folder path
-                        const baseFolder = mode === 'individual' 
-                            ? currentHistoryZip.folder('revisions').folder(String(vNum))
-                            : rootZipFolder.folder(projectFolderName).folder('revisions').folder(String(vNum));
-
-                        // Write Files & Calc Size
-                        let revSize = 0;
-                        for (const [path, content] of Object.entries(files)) {
-                            baseFolder.file(path.replace(/^\/+/, ''), content);
-                            revSize += content.byteLength;
-                        }
-                        
-                        currentHistorySize += revSize;
-                        projectSizeEstimate += revSize;
-                        if (mode === 'batch') currentZipSize += revSize;
+                        // Write to abstract writer
+                        await writer.add(`${projectFolderName}/revisions/${vNum}`, files);
 
                         // Log
                         const date = rev.created_at || new Date().toISOString();
@@ -378,13 +494,6 @@ async function processProject(project, username, options) {
                         commitLog += `${vNum}|${date}|${author}|${msg}\n`;
                         
                         success = true;
-
-                        // Check Split Limit (Individual Mode Only)
-                        if (mode === 'individual' && currentHistorySize > PROJECT_SPLIT_LIMIT) {
-                            console.log(`[Main] ✂️ Splitting history for ${project.slug} at rev ${vNum}`);
-                            currentHistoryZip.file("commit_log_part.txt", commitLog);
-                            await flushPart(false);
-                        }
 
                     } catch (revError) {
                          console.error(`[History] ⚠️ Rev ${vNum} failed:`, revError);
@@ -396,14 +505,13 @@ async function processProject(project, username, options) {
             
             // Finalize
             if (mode === 'individual') {
-                currentHistoryZip.file("commit_log.txt", commitLog);
-                currentHistoryZip.file("restore_git.sh", generateGitRestoreScript(), { unixPermissions: "755" });
-                await flushPart(true);
+                await writer.finalize(commitLog, generateGitRestoreScript());
             } else {
-                 // Batch mode
-                 const pFolder = rootZipFolder.folder(projectFolderName);
-                 pFolder.file("commit_log.txt", commitLog);
-                 pFolder.file("restore_git.sh", generateGitRestoreScript(), { unixPermissions: "755" });
+                 // For Batch, we just dump the scripts as "files"
+                 const metaFiles = {};
+                 metaFiles['commit_log.txt'] = new TextEncoder().encode(commitLog);
+                 metaFiles['restore_git.sh'] = new TextEncoder().encode(generateGitRestoreScript());
+                 await writer.add(projectFolderName, metaFiles);
                  updateStatus(uiId, 'done', 'Packaged');
             }
 
@@ -430,29 +538,13 @@ async function processProject(project, username, options) {
             const htmlBuffer = htmlContent ? new TextEncoder().encode(htmlContent) : new TextEncoder().encode(`<!-- Source missing -->`);
             files['index.html'] = htmlBuffer;
 
-            // Prepare Zip
-            const target = mode === 'individual' ? new JSZip() : rootZipFolder.folder(projectFolderName);
-            
-            let size = 0;
-            for (const [path, content] of Object.entries(files)) {
-                target.file(path.replace(/^\/+/, ''), content);
-                size += content.byteLength;
-            }
-            
-            if (mode === 'batch') {
-                currentZipSize += size;
-                updateStatus(uiId, 'done', 'Packaged');
+            // Write
+            await writer.add(projectFolderName, files);
+
+            if (mode === 'individual') {
+                await writer.finalize();
             } else {
-                // Individual Mode - Queue zipping
-                updateStatus(uiId, 'loading', 'Queued for Zip');
-                zipQueue.add(async () => {
-                    const blob = await target.generateAsync({ type: "blob" });
-                    const a = document.createElement('a');
-                    a.href = URL.createObjectURL(blob);
-                    a.download = `${username}_${projectFolderName}.zip`;
-                    a.click();
-                    URL.revokeObjectURL(a.href);
-                }, uiId);
+                updateStatus(uiId, 'done', 'Packaged');
             }
         }
 
@@ -462,7 +554,8 @@ async function processProject(project, username, options) {
 
     } catch (e) {
         console.error(`[Main] Error processing ${project.slug}:`, e);
-        updateStatus(uiId, 'error', `Failed: ${e.message}`);
+        updateStatus(uiId, 'error', e.message.includes("Timeout") ? "Timed Out" : "Failed");
+        throw e; // Propagate for concurrency pool
     }
 }
 
@@ -505,7 +598,6 @@ async function startBackup(isResume = false) {
 
     // Read Settings
     const mode = downloadModeInput.value;
-    const delay = parseInt(delayInput.value) || 3000;
     const skipForks = skipForksInput.checked;
     const includeHistory = includeHistoryInput.checked;
     const skipArchived = skipArchivedInput.checked;
@@ -513,14 +605,12 @@ async function startBackup(isResume = false) {
     const startDate = dateStartInput.value ? new Date(dateStartInput.value) : null;
     const endDate = dateEndInput.value ? new Date(dateEndInput.value) : null;
 
-    console.log(`[Main] Backup config: User=${username}, Mode=${mode}, Delay=${delay}, SkipForks=${skipForks}`);
+    console.log(`[Main] Backup config: User=${username}, Mode=${mode}, Concurrency=${CONCURRENCY_LIMIT}`);
 
     // Reset UI & Resume Logic
     isRunning = true;
     stopRequested = false;
     foundProjects = [];
-    batchPart = 1;
-    currentZipSize = 0;
     
     let startCursor = null;
 
@@ -540,7 +630,9 @@ async function startBackup(isResume = false) {
         statSize.textContent = '0 Bytes';
     }
 
-    zip = new JSZip();
+    if (mode === 'batch') {
+        batchManager.init(username, startBtn);
+    }
 
     startBtn.disabled = true;
     resumeBtn.disabled = true;
@@ -548,6 +640,9 @@ async function startBackup(isResume = false) {
     stopBtn.textContent = (mode === 'batch') ? "Stop & Save" : "Stop";
     usernameInput.disabled = true;
 
+    // Concurrency Pool
+    const activeTasks = new Set();
+    
     try {
         const onCursorSaved = (nextCursor) => {
             saveResumeState(username, nextCursor, processedCount);
@@ -558,7 +653,7 @@ async function startBackup(isResume = false) {
         for await (const project of generator) {
             if (stopRequested) break;
 
-            // --- FILTERING LOGIC ---
+            // --- FILTERING ---
             if (startDate || endDate) {
                 const pDate = new Date(project.created_at);
                 if (startDate && pDate < startDate) continue;
@@ -566,7 +661,6 @@ async function startBackup(isResume = false) {
             }
 
             if (skipForks && project.parent_id) {
-                console.log(`[Main] Skipping fork: ${project.slug}`);
                 continue;
             }
 
@@ -586,50 +680,38 @@ async function startBackup(isResume = false) {
                 continue;
             }
 
-            // --- Batch Splitting Logic ---
-            if (mode === 'batch' && currentZipSize > BATCH_SIZE_LIMIT) {
-                console.log(`[Main] 📦 Batch limit reached (${formatBytes(currentZipSize)}). Saving Part ${batchPart}...`);
-                
-                const saveLabel = `Saving Part ${batchPart}...`;
-                const oldText = startBtn.textContent;
-                startBtn.textContent = saveLabel;
-                updateStatus(project.id, 'pending', 'Waiting for Batch Split...');
-
-                const content = await zip.generateAsync({ type: "blob" });
-                
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(content);
-                a.download = `${username}_backup_part${batchPart}.zip`;
-                a.click();
-                URL.revokeObjectURL(a.href);
-                
-                batchPart++;
-                zip = new JSZip(); 
-                currentZipSize = 0;
-                startBtn.textContent = oldText;
-                
-                await new Promise(r => setTimeout(r, 1000));
+            // --- CONCURRENCY CONTROL ---
+            while (activeTasks.size >= CONCURRENCY_LIMIT) {
+                // Wait for at least one task to finish
+                await Promise.race(activeTasks);
             }
-
-            // Get Fresh User Folder (Linked to Current Zip)
-            const currentUserFolder = zip.folder(username);
-
-            // Process
-            await processProject(project, username, {
-                mode: mode,
-                rootZipFolder: currentUserFolder,
-                includeHistory: includeHistory
-            });
             
-            // Rate Limit
-            if (delay > 0) {
-                await new Promise(r => setTimeout(r, delay));
-            }
+            // Start Task
+            const taskPromise = withTimeout(
+                processProject(project, username, { mode, includeHistory }), 
+                PROJECT_TIMEOUT_MS
+            ).then(() => {
+                activeTasks.delete(taskPromise);
+            }).catch(err => {
+                console.error(`Task failed for ${project.slug}:`, err);
+                activeTasks.delete(taskPromise);
+                // Already handled in processProject, but ensure removal from set
+            });
+
+            activeTasks.add(taskPromise);
+            
+            // Small jitter so we don't hammer API instantly with 3 requests
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        // Wait for remaining
+        if (activeTasks.size > 0) {
+            statTotal.textContent = `${foundProjects.length} (Finishing...)`;
+            await Promise.allSettled(activeTasks);
         }
 
     } catch (e) {
         console.error("[Main] Loop error:", e);
-        // Add visual error to top of list
         const errDiv = document.createElement('div');
         errDiv.className = 'project-item';
         errDiv.style.borderColor = 'var(--error)';
@@ -649,41 +731,19 @@ async function finishBackup(mode) {
     stopBtn.textContent = "Stop";
     usernameInput.disabled = false;
 
-    // In individual mode, we are done.
     if (mode === 'individual') {
         alert(`Done! Processed ${processedCount} projects.`);
         return;
     }
 
-    // In batch mode, we check if we have anything to zip
-    if (processedCount === 0) {
-        alert("No projects were processed.");
-        return;
+    // Batch Mode Finalization
+    if (mode === 'batch') {
+        startBtn.textContent = "Finalizing...";
+        startBtn.disabled = true;
+        await batchManager.finish(statSize);
+        startBtn.textContent = "Start Backup";
+        startBtn.disabled = false;
     }
-
-    // Generate Giant Zip
-    startBtn.textContent = "Saving ZIP...";
-    startBtn.disabled = true;
-
-    try {
-        const content = await zip.generateAsync({ type: "blob" }, (metadata) => {
-             statSize.textContent = `Zipping: ${metadata.percent.toFixed(1)}%`;
-        });
-        
-        statSize.textContent = formatBytes(content.size);
-        
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(content);
-        a.download = `${usernameInput.value.replace('@','')}_full_backup_${Date.now()}.zip`;
-        a.click();
-        URL.revokeObjectURL(a.href);
-
-    } catch (e) {
-        alert("Error generating ZIP: " + e.message);
-    }
-
-    startBtn.textContent = "Start Backup";
-    startBtn.disabled = false;
 }
 
 startBtn.addEventListener('click', startBackup);
